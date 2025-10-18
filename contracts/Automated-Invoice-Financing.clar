@@ -28,11 +28,17 @@
 (define-constant max-extension u720)            ;; maximum extra blocks allowed for due-date extension
 (define-constant extension-fee-rate u75)        ;; 0.75% of invoice amount paid to investor on extension
 
+;; batch processing settings
+(define-constant max-batch-size u10)            ;; maximum invoices per batch operation
+(define-constant batch-discount-rate u50)       ;; 0.5% discount on interest for batch operations
+
 ;; data vars
 (define-data-var next-invoice-id uint u1)
 (define-data-var total-invoices-funded uint u0)
 (define-data-var total-volume uint u0)
 (define-data-var platform-treasury uint u0)
+(define-data-var next-batch-id uint u1)
+(define-data-var total-batch-operations uint u0)
 
 ;; data maps
 (define-map invoices
@@ -92,7 +98,53 @@
   }
 )
 
+(define-map batch-operations
+  uint
+  {
+    creator: principal,
+    invoice-ids: (list 10 uint),
+    total-amount: uint,
+    created-at: uint,
+    operation-type: (string-ascii 10)
+  }
+)
+
+(define-map invoice-batches
+  uint
+  uint
+)
+
 ;; public functions
+(define-public (create-batch-invoices (invoice-data (list 10 {debtor: principal, amount: uint, duration: uint})))
+  (let
+    (
+      (batch-id (var-get next-batch-id))
+      (current-block stacks-block-height)
+      (batch-size (len invoice-data))
+    )
+    (asserts! (<= batch-size max-batch-size) err-invalid-amount)
+    (asserts! (> batch-size u0) err-invalid-amount)
+    
+    (let
+      (
+        (invoice-ids (unwrap! (create-invoices-from-batch invoice-data current-block batch-id) err-invalid-amount))
+        (total-batch-amount (fold + (map get-invoice-amount invoice-data) u0))
+      )
+      (map-set batch-operations batch-id {
+        creator: tx-sender,
+        invoice-ids: invoice-ids,
+        total-amount: total-batch-amount,
+        created-at: current-block,
+        operation-type: "create"
+      })
+      
+      (var-set next-batch-id (+ batch-id u1))
+      (var-set total-batch-operations (+ (var-get total-batch-operations) u1))
+      (ok {batch-id: batch-id, invoice-ids: invoice-ids})
+    )
+  )
+)
+
 (define-public (create-invoice (debtor principal) (amount uint) (duration uint))
   (let
     (
@@ -123,6 +175,36 @@
     (update-business-profile tx-sender)
     (var-set next-invoice-id (+ invoice-id u1))
     (ok invoice-id)
+  )
+)
+
+(define-public (fund-batch-invoices (invoice-ids (list 10 uint)))
+  (let
+    (
+      (batch-id (var-get next-batch-id))
+      (current-block stacks-block-height)
+      (batch-size (len invoice-ids))
+    )
+    (asserts! (<= batch-size max-batch-size) err-invalid-amount)
+    (asserts! (> batch-size u0) err-invalid-amount)
+    
+    (let
+      (
+        (funding-results (unwrap! (fund-invoices-from-batch invoice-ids current-block) err-insufficient-funds))
+        (total-funded (get total-amount funding-results))
+      )
+      (map-set batch-operations batch-id {
+        creator: tx-sender,
+        invoice-ids: invoice-ids,
+        total-amount: total-funded,
+        created-at: current-block,
+        operation-type: "fund"
+      })
+      
+      (var-set next-batch-id (+ batch-id u1))
+      (var-set total-batch-operations (+ (var-get total-batch-operations) u1))
+      (ok {batch-id: batch-id, funded-count: (get funded-count funding-results), total-amount: total-funded})
+    )
   )
 )
 
@@ -311,6 +393,25 @@
   (map-get? invoice-extensions invoice-id)
 )
 
+(define-read-only (get-batch-operation (batch-id uint))
+  (map-get? batch-operations batch-id)
+)
+
+(define-read-only (get-invoice-batch (invoice-id uint))
+  (map-get? invoice-batches invoice-id)
+)
+
+(define-read-only (get-batch-invoices (invoice-ids (list 10 uint)))
+  (map get-invoice invoice-ids)
+)
+
+(define-read-only (get-batch-stats)
+  {
+    total-batch-operations: (var-get total-batch-operations),
+    next-batch-id: (var-get next-batch-id)
+  }
+)
+
 ;; private functions
 (define-private (update-business-profile (business principal))
   (let
@@ -372,4 +473,75 @@
       })
     )
   )
+)
+
+(define-private (create-invoices-from-batch (invoice-data (list 10 {debtor: principal, amount: uint, duration: uint})) (current-block uint) (batch-id uint))
+  (ok (unwrap! (fold create-invoice-from-data invoice-data (ok (list))) err-invalid-amount))
+)
+
+(define-private (create-invoice-from-data (data {debtor: principal, amount: uint, duration: uint}) (acc (response (list 10 uint) uint)))
+  (match acc
+    success-list
+    (let
+      (
+        (invoice-id (var-get next-invoice-id))
+        (current-block stacks-block-height)
+        (due-block (+ current-block (get duration data)))
+        (batch-adjusted-rate (- (calculate-interest-rate tx-sender (get amount data)) batch-discount-rate))
+      )
+      (asserts! (>= (get amount data) min-invoice-amount) err-invalid-amount)
+      (asserts! (<= (get amount data) max-invoice-amount) err-invalid-amount)
+      (asserts! (>= (get duration data) min-duration) err-invalid-duration)
+      (asserts! (<= (get duration data) max-duration) err-invalid-duration)
+      (asserts! (not (is-eq tx-sender (get debtor data))) err-unauthorized)
+      
+      (map-set invoices invoice-id {
+        business: tx-sender,
+        debtor: (get debtor data),
+        amount: (get amount data),
+        funded-amount: u0,
+        interest-rate: batch-adjusted-rate,
+        created-at: current-block,
+        due-at: due-block,
+        funded-at: none,
+        paid-at: none,
+        investor: none,
+        status: "pending"
+      })
+      
+      (update-business-profile tx-sender)
+      (var-set next-invoice-id (+ invoice-id u1))
+      (ok (unwrap! (as-max-len? (append success-list invoice-id) u10) err-invalid-amount))
+    )
+    error-val (err error-val)
+  )
+)
+
+(define-private (fund-invoices-from-batch (invoice-ids (list 10 uint)) (current-block uint))
+  (fold fund-single-invoice-in-batch invoice-ids (ok {funded-count: u0, total-amount: u0}))
+)
+
+(define-private (fund-single-invoice-in-batch (invoice-id uint) (acc (response {funded-count: uint, total-amount: uint} uint)))
+  (match acc
+    success-data
+    (match (fund-invoice invoice-id)
+      success-result
+      (let
+        (
+          (invoice (unwrap-panic (map-get? invoices invoice-id)))
+          (funding-amount (get funded-amount invoice))
+        )
+        (ok {
+          funded-count: (+ (get funded-count success-data) u1),
+          total-amount: (+ (get total-amount success-data) funding-amount)
+        })
+      )
+      error-val acc
+    )
+    error-val (err error-val)
+  )
+)
+
+(define-private (get-invoice-amount (data {debtor: principal, amount: uint, duration: uint}))
+  (get amount data)
 )
