@@ -16,7 +16,7 @@
 (define-constant err-already-funded (err u108))
 (define-constant err-not-due (err u109))
 (define-constant err-already-paid (err u110))
-
+(define-constant err-invalid-status (err u111))
 (define-constant min-invoice-amount u1000)
 (define-constant max-invoice-amount u10000000)
 (define-constant min-duration u144)
@@ -95,6 +95,14 @@
     fee: uint,                   ;; extension fee amount paid
     extended-at: uint,           ;; block height when extension applied
     extended-by: principal       ;; debtor who requested extension
+  }
+)
+
+(define-map invoice-cancellations
+  uint
+  {
+    cancelled-at: uint,
+    cancelled-by: principal
   }
 )
 
@@ -329,6 +337,29 @@
   )
 )
 
+(define-public (cancel-invoice (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+      (current-block stacks-block-height)
+    )
+    (asserts! (or (is-eq tx-sender (get business invoice)) (is-eq tx-sender contract-owner)) err-unauthorized)
+    (asserts! (is-eq (get status invoice) "pending") err-invalid-status)
+    
+    (map-set invoices invoice-id
+      (merge invoice {
+        status: "cancelled"
+      })
+    )
+
+    (map-set invoice-cancellations invoice-id {
+      cancelled-at: current-block,
+      cancelled-by: tx-sender
+    })
+    (ok true)
+  )
+)
+
 (define-public (withdraw-platform-fees)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -391,6 +422,10 @@
 
 (define-read-only (get-invoice-extension (invoice-id uint))
   (map-get? invoice-extensions invoice-id)
+)
+
+(define-read-only (get-invoice-cancellation (invoice-id uint))
+  (map-get? invoice-cancellations invoice-id)
 )
 
 (define-read-only (get-batch-operation (batch-id uint))
