@@ -32,6 +32,13 @@
 (define-constant max-batch-size u10)            ;; maximum invoices per batch operation
 (define-constant batch-discount-rate u50)       ;; 0.5% discount on interest for batch operations
 
+;; partial funding settings
+(define-constant min-partial-funding u500)
+(define-constant max-investors-per-invoice u5)
+(define-constant err-min-funding-not-met (err u112))
+(define-constant err-max-investors-reached (err u113))
+(define-constant err-already-investor (err u114))
+
 ;; data vars
 (define-data-var next-invoice-id uint u1)
 (define-data-var total-invoices-funded uint u0)
@@ -120,6 +127,28 @@
 (define-map invoice-batches
   uint
   uint
+)
+
+(define-map invoice-investors
+  {invoice-id: uint, investor: principal}
+  {
+    contribution: uint,
+    funded-at: uint,
+    claimed: bool
+  }
+)
+
+(define-map invoice-investor-count
+  uint
+  uint
+)
+
+(define-map invoice-partial-funding
+  uint
+  {
+    total-raised: uint,
+    fully-funded: bool
+  }
 )
 
 ;; public functions
@@ -371,6 +400,101 @@
   )
 )
 
+(define-public (partial-fund-invoice (invoice-id uint) (contribution uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+      (current-block stacks-block-height)
+      (funding-target (calculate-funding-amount (get amount invoice) (get interest-rate invoice)))
+      (partial-data (default-to {total-raised: u0, fully-funded: false} (map-get? invoice-partial-funding invoice-id)))
+      (investor-count (default-to u0 (map-get? invoice-investor-count invoice-id)))
+      (existing-investment (map-get? invoice-investors {invoice-id: invoice-id, investor: tx-sender}))
+      (remaining (- funding-target (get total-raised partial-data)))
+      (actual-contribution (if (> contribution remaining) remaining contribution))
+    )
+    (asserts! (or (is-eq (get status invoice) "pending") (is-eq (get status invoice) "partial")) err-already-funded)
+    (asserts! (< current-block (get due-at invoice)) err-invoice-expired)
+    (asserts! (>= actual-contribution min-partial-funding) err-min-funding-not-met)
+    (asserts! (is-none existing-investment) err-already-investor)
+    (asserts! (< investor-count max-investors-per-invoice) err-max-investors-reached)
+    (asserts! (>= (stx-get-balance tx-sender) actual-contribution) err-insufficient-funds)
+
+    (try! (stx-transfer? actual-contribution tx-sender (get business invoice)))
+
+    (map-set invoice-investors {invoice-id: invoice-id, investor: tx-sender} {
+      contribution: actual-contribution,
+      funded-at: current-block,
+      claimed: false
+    })
+
+    (map-set invoice-investor-count invoice-id (+ investor-count u1))
+
+    (let
+      (
+        (new-total (+ (get total-raised partial-data) actual-contribution))
+        (is-fully-funded (>= new-total funding-target))
+      )
+      (map-set invoice-partial-funding invoice-id {
+        total-raised: new-total,
+        fully-funded: is-fully-funded
+      })
+
+      (if is-fully-funded
+        (begin
+          (map-set invoices invoice-id
+            (merge invoice {
+              funded-amount: new-total,
+              funded-at: (some current-block),
+              status: "funded"
+            })
+          )
+          (var-set total-invoices-funded (+ (var-get total-invoices-funded) u1))
+        )
+        (map-set invoices invoice-id
+          (merge invoice {
+            funded-amount: new-total,
+            status: "partial"
+          })
+        )
+      )
+
+      (update-investor-profile tx-sender actual-contribution)
+      (var-set total-volume (+ (var-get total-volume) actual-contribution))
+      (ok {contribution: actual-contribution, total-raised: new-total, fully-funded: is-fully-funded})
+    )
+  )
+)
+
+(define-public (claim-partial-repayment (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+      (investment (unwrap! (map-get? invoice-investors {invoice-id: invoice-id, investor: tx-sender}) err-not-found))
+      (partial-data (unwrap! (map-get? invoice-partial-funding invoice-id) err-not-found))
+      (payment-info (unwrap! (map-get? invoice-payments invoice-id) err-not-found))
+    )
+    (asserts! (is-eq (get status invoice) "paid") err-not-due)
+    (asserts! (not (get claimed investment)) err-already-paid)
+    (asserts! (get fully-funded partial-data) err-invalid-status)
+
+    (let
+      (
+        (total-raised (get total-raised partial-data))
+        (investor-share (/ (* (get amount invoice) (get contribution investment)) total-raised))
+        (investor-earnings (- investor-share (get contribution investment)))
+      )
+      (try! (as-contract (stx-transfer? investor-share tx-sender tx-sender)))
+
+      (map-set invoice-investors {invoice-id: invoice-id, investor: tx-sender}
+        (merge investment {claimed: true})
+      )
+
+      (update-investor-earnings tx-sender investor-earnings)
+      (ok {amount-claimed: investor-share, earnings: investor-earnings})
+    )
+  )
+)
+
 ;; read only functions
 (define-read-only (get-invoice (invoice-id uint))
   (map-get? invoices invoice-id)
@@ -434,6 +558,18 @@
 
 (define-read-only (get-invoice-batch (invoice-id uint))
   (map-get? invoice-batches invoice-id)
+)
+
+(define-read-only (get-partial-funding-info (invoice-id uint))
+  (map-get? invoice-partial-funding invoice-id)
+)
+
+(define-read-only (get-investor-contribution (invoice-id uint) (investor principal))
+  (map-get? invoice-investors {invoice-id: invoice-id, investor: investor})
+)
+
+(define-read-only (get-invoice-investor-count (invoice-id uint))
+  (default-to u0 (map-get? invoice-investor-count invoice-id))
 )
 
 (define-read-only (get-batch-invoices (invoice-ids (list 10 uint)))
